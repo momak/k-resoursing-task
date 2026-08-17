@@ -1,28 +1,42 @@
 using Claims.Auditing;
-using Claims.Controllers;
+using Claims.Data;
+using Claims.Services;
 using Microsoft.EntityFrameworkCore;
 using MongoDB.Driver;
-using System.Runtime.InteropServices;
 using System.Text.Json.Serialization;
 using Testcontainers.MongoDb;
 using Testcontainers.MsSql;
 
 var builder = WebApplication.CreateBuilder(args);
 
-// Start Testcontainers for SQL Server and MongoDB
-var sqlContainer = (RuntimeInformation.IsOSPlatform(OSPlatform.Linux)
-        ? new MsSqlBuilder()
-            .WithImage("mcr.microsoft.com/mssql/server:2022-latest")
-        : new()
+var isTesting = builder.Environment.IsEnvironment("Testing");
 
-    ).Build();
+MsSqlContainer? sqlContainer = null;
+MongoDbContainer? mongoContainer = null;
 
-var mongoContainer = new MongoDbBuilder()
-    .WithImage("mongo:latest")
-    .Build();
+if (!isTesting)
+{
+    sqlContainer = new MsSqlBuilder("mcr.microsoft.com/mssql/server:2022-latest")
+        .WithPortBinding(14330, 1433)
+        .WithCleanUp(true)
+        .Build();
 
-await sqlContainer.StartAsync();
-await mongoContainer.StartAsync();
+    mongoContainer = new MongoDbBuilder("mongo:latest")
+        .WithPortBinding(27018, 27017)
+        .WithCleanUp(true)
+        .Build();
+
+    await sqlContainer.StartAsync();
+    await mongoContainer.StartAsync();
+
+    Console.WriteLine($"SQL Server: {sqlContainer.GetConnectionString()}");
+    Console.WriteLine($"MongoDB:    {mongoContainer.GetConnectionString()}");
+}
+
+builder.Services
+    .AddClaimsData()
+    .AddClaimsServices()
+    .AddClaimsAuditing();
 
 // Add services to the container.
 builder.Services
@@ -32,16 +46,18 @@ builder.Services
         x.JsonSerializerOptions.Converters.Add(new JsonStringEnumConverter());
     });
 
-builder.Services.AddDbContext<AuditContext>(options =>
-    options.UseSqlServer(sqlContainer.GetConnectionString()));
-
-builder.Services.AddDbContext<ClaimsContext>(options =>
+if (!isTesting)
 {
-    var client = new MongoClient(mongoContainer.GetConnectionString());
-    var database = client.GetDatabase(builder.Configuration["MongoDb:DatabaseName"]); // Use a default/test database name
-    options.UseMongoDB(database.Client, database.DatabaseNamespace.DatabaseName);
-});
+    builder.Services.AddDbContext<AuditContext>(options =>
+        options.UseSqlServer(sqlContainer!.GetConnectionString()));
 
+    builder.Services.AddDbContext<ClaimsContext>(options =>
+    {
+        var client = new MongoClient(mongoContainer!.GetConnectionString());
+        var database = client.GetDatabase(builder.Configuration["MongoDb:DatabaseName"]);
+        options.UseMongoDB(database.Client, database.DatabaseNamespace.DatabaseName);
+    });
+}
 // Learn more about configuring Swagger/OpenAPI at https://aka.ms/aspnetcore/swashbuckle
 builder.Services.AddEndpointsApiExplorer();
 builder.Services.AddSwaggerGen();
@@ -56,16 +72,36 @@ if (app.Environment.IsDevelopment())
 }
 
 app.UseHttpsRedirection();
-
 app.UseAuthorization();
-
 app.MapControllers();
 
-using (var scope = app.Services.CreateScope())
+if (!isTesting)
 {
+    using var scope = app.Services.CreateScope();
     var context = scope.ServiceProvider.GetRequiredService<AuditContext>();
     context.Database.Migrate();
 }
+
+
+app.UseExceptionHandler(errApp =>
+{
+    errApp.Run(async context =>
+    {
+        var feature = context.Features.Get<Microsoft.AspNetCore.Diagnostics.IExceptionHandlerFeature>();
+        if (feature?.Error is FluentValidation.ValidationException validationEx)
+        {
+            context.Response.StatusCode = StatusCodes.Status400BadRequest;
+            context.Response.ContentType = "application/json";
+            await context.Response.WriteAsJsonAsync(new
+            {
+                errors = validationEx.Errors.Select(e => e.ErrorMessage)
+            });
+            return;
+        }
+
+        context.Response.StatusCode = StatusCodes.Status500InternalServerError;
+    });
+});
 
 app.Run();
 
